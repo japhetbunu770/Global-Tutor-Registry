@@ -9,6 +9,11 @@
 (define-constant ERR-VERIFICATION-FEE (err u104))
 (define-constant ERR-ALREADY-VERIFIED (err u105))
 (define-constant ERR-INVALID-SUBJECT (err u106))
+(define-constant ERR-SESSION-NOT-FOUND (err u107))
+(define-constant ERR-INSUFFICIENT-PAYMENT (err u108))
+(define-constant ERR-SESSION-COMPLETED (err u109))
+(define-constant ERR-SESSION-CANCELLED (err u110))
+(define-constant ERR-INVALID-DURATION (err u111))
 
 (define-constant VERIFICATION-FEE u1000000)
 (define-constant MIN-RATING u1)
@@ -16,6 +21,7 @@
 
 (define-data-var total-tutors uint u0)
 (define-data-var verification-fee uint VERIFICATION-FEE)
+(define-data-var session-counter uint u0)
 
 (define-map tutors 
   principal 
@@ -59,6 +65,25 @@
 (define-map subject-registry
   (string-ascii 30)
   (list 100 principal))
+
+(define-map sessions
+  uint
+  {
+    student: principal,
+    tutor: principal,
+    duration-hours: uint,
+    total-payment: uint,
+    scheduled-at: uint,
+    status: (string-ascii 20),
+    completed-at: (optional uint)
+  })
+
+(define-map session-escrow
+  uint
+  {
+    amount: uint,
+    deposited: bool
+  })
 
 (define-public (register-tutor 
   (name (string-ascii 50))
@@ -235,3 +260,95 @@
     verification-fee: (var-get verification-fee),
     contract-owner: CONTRACT-OWNER
   })
+
+(define-public (book-session (tutor principal) (duration-hours uint) (scheduled-at uint))
+  (let
+    (
+      (caller tx-sender)
+      (tutor-data (unwrap! (map-get? tutors tutor) ERR-TUTOR-NOT-FOUND))
+      (session-id (+ (var-get session-counter) u1))
+      (total-payment (* (get hourly-rate tutor-data) duration-hours))
+    )
+    (asserts! (> duration-hours u0) ERR-INVALID-DURATION)
+    (asserts! (not (is-eq caller tutor)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= (stx-get-balance caller) total-payment) ERR-INSUFFICIENT-PAYMENT)
+    
+    (try! (stx-transfer? total-payment caller (as-contract tx-sender)))
+    
+    (map-set sessions session-id {
+      student: caller,
+      tutor: tutor,
+      duration-hours: duration-hours,
+      total-payment: total-payment,
+      scheduled-at: scheduled-at,
+      status: "pending",
+      completed-at: none
+    })
+    
+    (map-set session-escrow session-id {
+      amount: total-payment,
+      deposited: true
+    })
+    
+    (var-set session-counter session-id)
+    (ok session-id)))
+
+(define-public (complete-session (session-id uint))
+  (let
+    (
+      (caller tx-sender)
+      (session-data (unwrap! (map-get? sessions session-id) ERR-SESSION-NOT-FOUND))
+      (escrow-data (unwrap! (map-get? session-escrow session-id) ERR-SESSION-NOT-FOUND))
+      (current-block stacks-block-height)
+      (tutor-principal (get tutor session-data))
+      (payment-amount (get amount escrow-data))
+    )
+    (asserts! (is-eq caller tutor-principal) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status session-data) "pending") ERR-SESSION-COMPLETED)
+    (asserts! (is-eq (get deposited escrow-data) true) ERR-INSUFFICIENT-PAYMENT)
+    
+    (try! (as-contract (stx-transfer? payment-amount tx-sender tutor-principal)))
+    
+    (map-set sessions session-id (merge session-data {
+      status: "completed",
+      completed-at: (some current-block)
+    }))
+    
+    (map-set session-escrow session-id (merge escrow-data {
+      deposited: false
+    }))
+    (ok true)))
+
+(define-public (cancel-session (session-id uint))
+  (let
+    (
+      (caller tx-sender)
+      (session-data (unwrap! (map-get? sessions session-id) ERR-SESSION-NOT-FOUND))
+      (escrow-data (unwrap! (map-get? session-escrow session-id) ERR-SESSION-NOT-FOUND))
+      (student-principal (get student session-data))
+      (refund-amount (get amount escrow-data))
+    )
+    (asserts! (is-eq caller student-principal) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status session-data) "pending") ERR-SESSION-COMPLETED)
+    (asserts! (is-eq (get deposited escrow-data) true) ERR-INSUFFICIENT-PAYMENT)
+    
+    (try! (as-contract (stx-transfer? refund-amount tx-sender student-principal)))
+    
+    (map-set sessions session-id (merge session-data {
+      status: "cancelled",
+      completed-at: none
+    }))
+    
+    (map-set session-escrow session-id (merge escrow-data {
+      deposited: false
+    }))
+    (ok true)))
+
+(define-read-only (get-session (session-id uint))
+  (map-get? sessions session-id))
+
+(define-read-only (get-session-escrow (session-id uint))
+  (map-get? session-escrow session-id))
+
+(define-read-only (get-total-sessions)
+  (var-get session-counter))
